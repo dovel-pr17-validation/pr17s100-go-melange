@@ -1,0 +1,455 @@
+// Copyright 2022, 2023 Chainguard, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package tarball
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"syscall"
+
+	"go.opentelemetry.io/otel"
+	"golang.org/x/sys/unix"
+
+	apkfs "chainguard.dev/apko/pkg/apk/fs"
+	"chainguard.dev/apko/pkg/passwd"
+
+	// SHA1 is required by the APK package format specification for file checksums.
+	// This is not used for cryptographic security but for integrity verification
+	// as mandated by apk-tools. Cannot be replaced with stronger algorithms without
+	// breaking APK package compatibility. Autentication is performed with the sha256 datahash.
+	"github.com/pjbgf/sha1cd"
+)
+
+const xattrTarPAXRecordsPrefix = "SCHILY.xattr."
+
+func hasHardlinks(fi fs.FileInfo) bool {
+	if stat := fi.Sys(); stat != nil {
+		si, ok := stat.(*syscall.Stat_t)
+		if !ok {
+			return false
+		}
+
+		// if we don't have inodes, we just assume the filesystem
+		// does not support hardlinks
+		if si == nil {
+			return false
+		}
+
+		return si.Nlink > 1
+	}
+
+	return false
+}
+
+func getInodeFromFileInfo(fi fs.FileInfo) (uint64, error) {
+	if stat := fi.Sys(); stat != nil {
+		si, ok := stat.(*syscall.Stat_t)
+		if !ok {
+			return 0, fmt.Errorf("unable to stat underlying file")
+		}
+
+		// if we don't have inodes, we just assume the filesystem
+		// does not support hardlinks
+		if si == nil {
+			return 0, fmt.Errorf("unable to stat underlying file")
+		}
+
+		return si.Ino, nil
+	}
+
+	return 0, fmt.Errorf("unable to stat underlying file")
+}
+
+// DiskLinks finds regular files with several hard links under a directory
+// on disk.
+type DiskLinks struct {
+	root *os.Root
+}
+
+// OpenDiskLinks opens dir to look for hardlinks in. Call Close when done.
+func OpenDiskLinks(dir string) (*DiskLinks, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s to detect hardlinks: %w", dir, err)
+	}
+	return &DiskLinks{root: root}, nil
+}
+
+func (d *DiskLinks) Close() error {
+	return d.root.Close()
+}
+
+// Inode returns the inode of the regular file at name, a slash-separated path
+// relative to the directory, if it has more than one link. A file missing
+// from disk (kept only in memory by an fs.FS such as apko's DirFS) is not
+// linked to anything.
+func (d *DiskLinks) Inode(name string) (uint64, bool, error) {
+	fi, err := d.root.Lstat(filepath.FromSlash(name))
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !fi.Mode().IsRegular() || !hasHardlinks(fi) {
+		return 0, false, nil
+	}
+	inode, err := getInodeFromFileInfo(fi)
+	if err != nil {
+		return 0, false, err
+	}
+	return inode, true, nil
+}
+
+// LinkTargets decides which paths of hard linked files are written as link
+// entries. Every path of an inode links to the first one seen, unless either
+// of the two has xattrs: apk-tools chowns a link after creating it, which
+// makes the kernel clear security.capability on the inode the link shares.
+// A path with xattrs is written as a file of its own and is not linked to.
+type LinkTargets struct {
+	seen map[uint64]linkTarget
+}
+
+type linkTarget struct {
+	name   string
+	xattrs bool
+}
+
+// Target records name as a path of inode, with the xattrs listed for name, and
+// returns the path name is to be written as a link to, if any.
+func (l *LinkTargets) Target(inode uint64, name string, xattrs map[string][]byte) (string, bool) {
+	if l.seen == nil {
+		l.seen = map[uint64]linkTarget{}
+	}
+	target, ok := l.seen[inode]
+	if !ok {
+		l.seen[inode] = linkTarget{name: name, xattrs: len(xattrs) > 0}
+		return "", false
+	}
+	if target.xattrs || len(xattrs) > 0 {
+		return "", false
+	}
+	return target.name, true
+}
+
+func (c *Context) writeTar(ctx context.Context, tw *tar.Writer, fsys fs.FS, users, groups map[int]string) error { //nolint:gocyclo
+	if users == nil {
+		users = map[int]string{}
+	}
+	if groups == nil {
+		groups = map[int]string{}
+	}
+	var targets LinkTargets
+	var disk *DiskLinks
+	if c.diskDir != "" {
+		var err error
+		if disk, err = OpenDiskLinks(c.diskDir); err != nil {
+			return err
+		}
+		defer disk.Close()
+	}
+	// set this once, to make it easy to look up later
+	if c.overridePerms == nil {
+		c.overridePerms = map[string]tar.Header{}
+	}
+
+	buf := make([]byte, 1<<20)
+
+	if err := fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// skip the root path, superfluous
+		if path == "." {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		var (
+			link         string
+			major, minor uint32
+			isCharDevice bool
+		)
+		if info.Mode()&os.ModeSymlink == os.ModeSymlink {
+			rlfs, ok := fsys.(apkfs.ReadLinkFS)
+			if !ok {
+				return fmt.Errorf("readlink not supported by this fs: path (%s)", path)
+			}
+
+			if link, err = rlfs.Readlink(path); err != nil {
+				return err
+			}
+		}
+
+		if info.Mode()&os.ModeCharDevice == os.ModeCharDevice {
+			rlfs, ok := fsys.(apkfs.ReadnodFS)
+			if !ok {
+				return fmt.Errorf("read character device not supported by this fs: path (%s) %#v %#v", path, info, fsys)
+			}
+			isCharDevice = true
+			dev, err := rlfs.Readnod(path)
+			if err != nil {
+				return err
+			}
+			// Device numbers should be non-negative
+			devUint := uint64(0)
+			if dev > 0 {
+				devUint = uint64(dev)
+			}
+			major = unix.Major(devUint)
+			minor = unix.Minor(devUint)
+		}
+
+		header, err := tar.FileInfoHeader(info, link)
+		if err != nil {
+			return err
+		}
+		// devices
+		if isCharDevice {
+			header.Devmajor = int64(major)
+			header.Devminor = int64(minor)
+		}
+		// work around some weirdness, without this we wind up with just the basename
+		header.Name = path
+
+		// if SourceDateEpoch is set explicitly, overwrite the timestamps, otherwise propagate modtime
+		// (this option is unused in apko but melange uses this, so we support it for now)
+		header.AccessTime = c.SourceDateEpoch
+		header.ModTime = c.SourceDateEpoch
+		header.ChangeTime = c.SourceDateEpoch
+
+		if uid, ok := c.remapUIDs[header.Uid]; ok {
+			header.Uid = uid
+		}
+
+		if gid, ok := c.remapGIDs[header.Gid]; ok {
+			header.Gid = gid
+		}
+
+		if name, ok := users[header.Uid]; ok {
+			header.Uname = name
+		}
+		if name, ok := groups[header.Gid]; ok {
+			header.Gname = name
+		}
+
+		if c.OverrideUIDGID {
+			header.Uid = c.UID
+			header.Gid = c.GID
+		}
+
+		if c.OverrideUname != "" {
+			header.Uname = c.OverrideUname
+		}
+
+		if c.OverrideGname != "" {
+			header.Gname = c.OverrideGname
+		}
+
+		// look for the override perms with or without the leading /
+		if h, ok := c.overridePerms[header.Name]; ok {
+			header.Mode = h.Mode
+			header.Uid = h.Uid
+			header.Gid = h.Gid
+			header.Uname = h.Uname
+			header.Gname = h.Gname
+		}
+		if h, ok := c.overridePerms["/"+header.Name]; ok {
+			header.Mode = h.Mode
+			header.Uid = h.Uid
+			header.Gid = h.Gid
+			header.Uname = h.Uname
+			header.Gname = h.Gname
+		}
+
+		if link != "" {
+			header.Typeflag = tar.TypeSymlink
+		}
+		// only capture xattrs for real objects in the FS
+		var xattrs map[string][]byte
+		if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeDir {
+			if xfs, ok := fsys.(apkfs.XattrFS); ok {
+				// we can ignore errors
+				if x, err := xfs.ListXattrs(path); err == nil {
+					xattrs = x
+				}
+			}
+		}
+
+		// only regular files become links: a link entry carries no target or
+		// device number of its own
+		if info.Mode().IsRegular() {
+			var (
+				inode  uint64
+				linked bool
+			)
+			if disk != nil {
+				if inode, linked, err = disk.Inode(path); err != nil {
+					return err
+				}
+			} else if hasHardlinks(info) {
+				if inode, err = getInodeFromFileInfo(info); err != nil {
+					return err
+				}
+				linked = true
+			}
+
+			if linked {
+				if oldpath, ok := targets.Target(inode, header.Name, xattrs); ok {
+					header.Typeflag = tar.TypeLink
+					header.Linkname = oldpath
+					header.Size = 0
+				}
+			}
+		}
+
+		if header.PAXRecords == nil {
+			header.PAXRecords = map[string]string{}
+		}
+		if c.UseChecksums {
+			if link != "" {
+				// SHA1 required by APK format (apk-tools expects this specific algorithm)
+				linkDigest, collision := sha1cd.Sum([]byte(link))
+				if collision {
+					return fmt.Errorf("sha1cd collision detected")
+				}
+				linkChecksum := hex.EncodeToString(linkDigest[:])
+				header.PAXRecords["APK-TOOLS.checksum.SHA1"] = linkChecksum
+			} else if header.Typeflag == tar.TypeReg {
+				data, err := fsys.Open(path)
+				if err != nil {
+					return err
+				}
+				defer data.Close()
+
+				// SHA1 required by APK format (apk-tools expects this specific algorithm)
+				fileDigest := sha1cd.New().(sha1cd.CollisionResistantHash)
+				if _, err := io.CopyBuffer(fileDigest, data, buf); err != nil {
+					return err
+				}
+
+				fileSum, collision := fileDigest.CollisionResistantSum(nil)
+				if collision {
+					return fmt.Errorf("sha1cd collision detected")
+				}
+				fileChecksum := hex.EncodeToString(fileSum)
+				header.PAXRecords["APK-TOOLS.checksum.SHA1"] = fileChecksum
+			}
+		}
+
+		// a link entry has no xattrs: LinkTargets keeps paths with xattrs as
+		// regular entries
+		for name, value := range xattrs {
+			header.PAXRecords[xattrTarPAXRecordsPrefix+name] = string(value)
+		}
+
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+
+		if header.Typeflag == tar.TypeReg && header.Size > 0 {
+			data, err := fsys.Open(path)
+			if err != nil {
+				return err
+			}
+
+			defer data.Close()
+
+			if _, err := io.CopyBuffer(tw, data, buf); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// WriteArchive writes a tarball to the provided io.Writer from the provided fs.FS.
+// To override permissions, set the OverridePerms when creating the Context.
+// If you need to get multiple filesystems, merge them prior to calling WriteArchive.
+//
+// Deprecated: Use WriteTargz or WriteTar instead.
+func (c *Context) WriteArchive(dst io.Writer, src fs.FS) error {
+	return c.WriteTargz(context.Background(), dst, src, src)
+}
+
+// WriteTargz writes a gzipped tarball to the provided io.Writer from the provided fs.FS.
+// To override permissions, set the OverridePerms when creating the Context.
+// If you need to get multiple filesystems, merge them prior to calling WriteArchive.
+// userinfosrc should be a fs which can provide an optionally provide an etc/passwd and etc/group file.
+// The etc/passwd and etc/group file provide username and group name mappings for the tar.
+func (c *Context) WriteTargz(ctx context.Context, dst io.Writer, src fs.FS, userinfofs fs.FS) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "WriteTargz")
+	defer span.End()
+
+	gzw := gzip.NewWriter(dst)
+	defer gzw.Close()
+
+	return c.WriteTar(ctx, gzw, src, userinfofs)
+}
+
+// WriteTar writes a tarball to the provided io.Writer from the provided fs.FS.
+// To override permissions, set the OverridePerms when creating the Context.
+// If you need to get multiple filesystems, merge them prior to calling WriteArchive.
+// userinfosrc should be a fs which can provide an optionally provide an etc/passwd and etc/group file.
+// The etc/passwd and etc/group file provide username and group name mappings for the tar.
+func (c *Context) WriteTar(ctx context.Context, dst io.Writer, src fs.FS, userinfosrc fs.FS) error {
+	ctx, span := otel.Tracer("go-apk").Start(ctx, "WriteTar")
+	defer span.End()
+
+	tw := tar.NewWriter(dst)
+	if !c.SkipClose {
+		defer tw.Close()
+	} else {
+		defer tw.Flush()
+	}
+
+	// get the uname and gname maps
+	usersFile, _ := passwd.ReadUserFile(userinfosrc, "etc/passwd")
+	groupsFile, _ := passwd.ReadGroupFile(userinfosrc, "etc/group")
+	users := map[int]string{}
+	groups := map[int]string{}
+	for _, u := range usersFile.Entries {
+		users[int(u.UID)] = u.UserName
+	}
+	for _, g := range groupsFile.Entries {
+		groups[int(g.GID)] = g.GroupName
+	}
+	if err := c.writeTar(ctx, tw, src, users, groups); err != nil {
+		return fmt.Errorf("writing TAR archive failed: %w", err)
+	}
+
+	return nil
+}

@@ -1,0 +1,432 @@
+package:
+  name: test-git-checkout
+  version: 6.14
+  epoch: 0
+  description: This package mainly just tests git-checkout pipeline
+
+environment:
+  contents:
+    packages:
+      - busybox
+      - git
+
+vars:
+  workd: /tmp/test-git-checkout-workd
+  giturl: "file:///tmp/test-git-checkout-workd/repos/my-repo"
+
+pipeline:
+  - name: "Create the bogus package content"
+    runs: |
+      echo "package does not do anything" > "${{targets.contextdir}}/README"
+
+  - name: "Create a git repo"
+    runs: |
+      rm -Rf ${{vars.workd}}
+      mkdir -p ${{vars.workd}}/repos
+      repo=${{vars.workd}}/repos/my-repo
+
+      ./create-git-repo "$repo"
+      touch "$repo/git-daemon-export-ok"
+
+  - name: "standard tag on branch"
+    uses: git-checkout
+    working-directory: standard
+    with:
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+
+  - name: "check standard tag on branch"
+    working-directory: standard
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      cd ..
+      rm -Rf standard
+
+  - name: "standard no-working-directory"
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+
+  - name: "check standard no-working-directory"
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      [ -f create-git-repo ] ||
+         { echo "create-git-repo did not exist"; exit 1; }
+
+  - name: "destination"
+    uses: git-checkout
+    working-directory: destination-base
+    with:
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+      destination: dest
+
+  - name: "check destination"
+    working-directory: destination-base
+    runs: |
+      cd dest
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      cd ../..
+      rm -R destination-base
+
+  - name: "depth positive 1"
+    uses: git-checkout
+    working-directory: depth-positive-1
+    with:
+      depth: 1
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+
+  - name: "check depth positive 1"
+    working-directory: depth-positive-1
+    runs: |
+      if out=$(git show HEAD^ 2>&1); then
+          echo "FAIL: git show HEAD^ should not pass on checkout with depth 1"
+          echo "git show HEAD^ output: $output"
+          exit 1
+      fi
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      cd ..
+      rm -R depth-positive-1
+
+  - name: "depth negative 1"
+    working-directory: depth-negative-1
+    uses: git-checkout
+    with:
+      depth: -1
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+
+  - name: "check depth -1"
+    working-directory: depth-negative-1
+    runs: |
+      out=$(git show HEAD^ 2>&1) || {
+          echo "FAIL: git show HEAD^ failed on depth -1 checkout"
+          echo "git show HEAD^ output: $output"
+          exit 1
+      }
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      cd ..
+      rm -R depth-negative-1
+
+  - name: "branch without expected"
+    working-directory: branch-no-expected
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      reason: testing mutable git-checkout reference
+
+  - name: "check branch without expected"
+    working-directory: branch-no-expected
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f ]
+      cd ..
+      rm -R branch-no-expected
+
+  - name: "branch with old expected"
+    working-directory: branch-old-expected
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      # 21cfbec is on the 1.x branch but is not current.
+      expected-commit: 21cfbec4b951b9a0ba0a3bd9365fbb4fe81fa78d
+
+  - name: "check branch with old expected"
+    working-directory: branch-old-expected
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 21cfbec4b951b9a0ba0a3bd9365fbb4fe81fa78d ]
+      cd ..
+      rm -R branch-old-expected
+
+  # expected-commit-is-branch-tip: when the expected-commit IS the current tip
+  # of the branch, the checkout succeeds (the branch is treated as an immutable
+  # release pointer).  4b1593d is the current tip of the 1.x branch.
+  #
+  # The flag is verification-only and must not change the clone depth.  With no
+  # explicit depth, branch + expected-commit-is-branch-tip defaults to a shallow
+  # (depth 1) clone -- we only compare against the tip -- so 'git show HEAD^'
+  # must fail here.
+  - name: "branch tip with expected-commit-is-branch-tip"
+    working-directory: branch-tip-expected
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      expected-commit: 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f
+      expected-commit-is-branch-tip: true
+
+  - name: "check branch tip with expected-commit-is-branch-tip"
+    working-directory: branch-tip-expected
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f ]
+      if out=$(git show HEAD^ 2>&1); then
+          echo "FAIL: expected a shallow clone (depth 1) but 'git show HEAD^' succeeded"
+          echo "git show HEAD^ output: $out"
+          exit 1
+      fi
+      cd ..
+      rm -R branch-tip-expected
+
+  # ...with an explicit depth: -1 it must still produce a full clone (some
+  # builds need history), so 'git show HEAD^' must succeed.
+  - name: "branch tip with expected-commit-is-branch-tip, depth -1"
+    working-directory: branch-tip-full
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      expected-commit: 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f
+      expected-commit-is-branch-tip: true
+      depth: -1
+
+  - name: "check branch tip with expected-commit-is-branch-tip, depth -1"
+    working-directory: branch-tip-full
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f ]
+      out=$(git show HEAD^ 2>&1) || {
+          echo "FAIL: expected a full clone (depth -1) but 'git show HEAD^' failed"
+          echo "git show HEAD^ output: $out"
+          exit 1
+      }
+      cd ..
+      rm -R branch-tip-full
+
+  # ...with an explicit finite depth it honors that depth: a depth-2 clone of
+  # 1.x has the tip and its parent but nothing beyond, so 'git show HEAD^'
+  # succeeds while 'git show HEAD~2' fails.
+  - name: "branch tip with expected-commit-is-branch-tip, partial depth"
+    working-directory: branch-tip-partial
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      expected-commit: 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f
+      expected-commit-is-branch-tip: true
+      depth: 2
+
+  - name: "check branch tip with expected-commit-is-branch-tip, partial depth"
+    working-directory: branch-tip-partial
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 4b1593d8d8038f8c0ce1e2c608c9dd89066a2a0f ]
+      out=$(git show HEAD^ 2>&1) || {
+          echo "FAIL: depth 2 should include HEAD^ but 'git show HEAD^' failed"
+          echo "git show HEAD^ output: $out"
+          exit 1
+      }
+      if out=$(git show HEAD~2 2>&1); then
+          echo "FAIL: depth 2 should not include HEAD~2 but 'git show HEAD~2' succeeded"
+          echo "git show HEAD~2 output: $out"
+          exit 1
+      fi
+      cd ..
+      rm -R branch-tip-partial
+
+  # a specific commit with no branch and no tag (the shape used by packages
+  # that pin an upstream commit directly, e.g. eco-python-llvm-triton pinning
+  # an llvm-project commit). With depth: -1 the full history is present, so the
+  # ancestry-guarded reset to the (older, on-default-branch) commit succeeds.
+  # 0007b4c is an older commit on the fixture's default branch.
+  - name: "expected commit, no branch"
+    working-directory: commit-no-branch
+    uses: git-checkout
+    with:
+      repository: ${{vars.giturl}}
+      expected-commit: 0007b4cdf2358e7d9b0d774baf5cba9f862c023b
+      depth: -1
+
+  - name: "check expected commit, no branch"
+    working-directory: commit-no-branch
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 0007b4cdf2358e7d9b0d774baf5cba9f862c023b ]
+      cd ..
+      rm -R commit-no-branch
+
+  # for an annotated tag you can point to either the commit
+  # or the tag object hash object
+  - name: "annotated hash"
+    uses: git-checkout
+    working-directory: annotated-hash
+    with:
+      repository: ${{vars.giturl}}
+      tag: 2.0-annotated
+      expected-commit: 4ce5bdbf45a68a166d931dd1247878829b5c0113
+
+  - name: "check annotated hash"
+    working-directory: annotated-hash
+    runs: |
+      git show-ref --tags -d
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      cd ..
+      rm -R annotated-hash
+
+  # special case with clone --branch if there is a tag and a branch
+  # with the same name.
+  - name: "tag and branch same name"
+    uses: git-checkout
+    working-directory: tag-and-branch
+    with:
+      repository: ${{vars.giturl}}
+      tag: dev
+      expected-commit: 2b9bb894348794bc840a2ee7553d54a1c80b9278
+
+  - name: "check tag and branch same name"
+    working-directory: tag-and-branch
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 2b9bb894348794bc840a2ee7553d54a1c80b9278 ]
+      cd ..
+      rm -R tag-and-branch
+
+  - name: "process cherry-picks"
+    uses: git-checkout
+    working-directory: cherry-pick-test
+    with:
+      repository: ${{vars.giturl}}
+      branch: 1.x
+      cherry-picks: |
+        main/582b4d7d62f1c512568649ce8b6db085a3d85a9f: here comment
+        cpick/16138cad5f7729c79eca69b4cf808247d5eed76c: second cherry-pick
+
+  - name: "check cherry-picks"
+    working-directory: cherry-pick-test
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      status=$(git status -b --porcelain)
+      expected_hash="225e712ae452645acbd8f137b13d6b1ded8a96a1"
+      [ "$hash" != "$expected_hash" ]
+      # git status should show being two commits head
+      [ "$status" == "## 1.x...origin/1.x [ahead 2]" ]
+      # for-cherry-pick.txt should exist as a file
+      [ -f for-cherry-pick.txt ]
+      # auto maintenance must be disabled so no fetch (like the unshallow
+      # fetch for cherry-picks) spawns a detached 'git maintenance run'
+      # that outlives the pipeline step.
+      [ "$(git config --get maintenance.auto)" = "false" ]
+      [ "$(git config --get gc.auto)" = "0" ]
+      cd ..
+      rm -R cherry-pick-test
+
+  # The tag path does two network operations -- the clone and then a fetch of
+  # the tag refspec -- and both must survive a flaky remote.  install-flaky-git
+  # shims git so the first 3 tag fetches fail the way gitlab.com does when it
+  # sheds load; the checkout is only reachable if the fetch is retried.
+  - name: "make the next 3 tag fetches fail"
+    runs: |
+      ./install-flaky-git 3
+
+  - name: "tag fetch retried on transient remote failure"
+    uses: git-checkout
+    working-directory: flaky-tag-fetch
+    with:
+      repository: ${{vars.giturl}}
+      tag: 2.0
+      expected-commit: 3dfc3dd573b814be48c07f7f8ae3c19a23b69865
+      max-retries: 5
+      initial-backoff: 1
+      max-backoff: 2
+
+  - name: "check tag fetch retried on transient remote failure"
+    working-directory: flaky-tag-fetch
+    runs: |
+      hash=$(git rev-parse --verify HEAD)
+      [ "$hash" = 3dfc3dd573b814be48c07f7f8ae3c19a23b69865 ]
+      # 3 injected failures + 1 success: anything less means the fetch was not
+      # retried, anything more means it retried when it should have stopped.
+      read attempts < /tmp/flaky-git.attempts
+      [ "$attempts" = 4 ] ||
+          { echo "expected 4 tag fetch attempts, got $attempts"; exit 1; }
+      cd ..
+      ./install-flaky-git --uninstall
+      rm -f /tmp/flaky-git.attempts
+      rm -R flaky-tag-fetch
+
+  # When ownership of files created inside and outside of the runner container do not
+  # match, if mode is restrictive on files like 0700 on the Melange workspace, if the git-checkout
+  # pipeline changes ownership on them, being that it runs inside the runner container, subsequent
+  # filesystem operations run outside of the runner fail because of missing permissions.
+  # This happens specifically with tar --extract without preserving ownership of existing files,
+  # like '.', which in case of the default input and standard usage of the pipeline, is the
+  # workspace directory.
+  # This results in subsequent operations like xattrs restore to fail as they are run outside of
+  # the runner container.
+  #
+  # Bubblewrap runner:
+  #   Since the user namespace is unshared and that the runner uid is mapped to the
+  #   uid of the user who runs Melange, ownership always match.
+  #   - Melange run by root -> runner user: root.
+  #     Owner of files created outside of the runner:
+  #       - host: root
+  #       - runner: root
+  #     Owner of files creted inside the runner:
+  #       - host: root
+  #       - runner: root
+  #   - Melange run by non-root -> runner user: build (1000 mapped to non-root).
+  #     Owner of files created outside of the runner:
+  #       - host: non-root
+  #       - runner: build (1000 -> host's non-root)
+  #     Owner of files creted inside the runner:
+  #       - host: non-root
+  #       - runner: build (1000 -> host's non-root)
+  #
+  # Docker runner:
+  #   Since the user namespace is shared, ownership between files created inside and
+  #   outside the runner, match only when the user who runs Melange is root.
+  #   - Melange run by root -> runner user: root.
+  #     Owner of files created outside of the runner:
+  #       - host: root
+  #       - runner: root
+  #     Owner of files creted inside the runner:
+  #       - host: root
+  #       - runner: root
+  #   - Melange run by non-root -> runner user: root.
+  #     Owner of files created outside of the runner:
+  #       - host: non-root
+  #       - runner: non-root
+  #     Owner of files creted inside the runner:
+  #       - host: root
+  #       - runner: root
+  #
+  # QEMU runner:
+  #   File ownership inside and outside of the runner VM always match.
+  #
+  - name: "check ownership of existing files"
+    runs: |
+      set -eu
+      runner_user=$(id -u)
+      melange_user=$(stat -c "%u" .)
+
+      exclude_args="! -regex ^\.\/\.ssh.*$ ! -regex ^./.gitconfig$"
+      find . -user "$melange_user" $exclude_args | sort > /tmp/melange-owned.lst
+      find . -user "$runner_user" $exclude_args | sort > /tmp/runner-owned.lst
+
+      if [ "${runner_user}" = "${melange_user}" ]; then
+        sort -u melange-created.lst runner-created.lst > \
+          /tmp/expected-melange-owned.lst
+        cp /tmp/expected-melange-owned.lst /tmp/expected-runner-owned.lst
+      else
+        cp melange-created.lst /tmp/expected-melange-owned.lst
+        cp runner-created.lst /tmp/expected-runner-owned.lst
+      fi
+
+      diff -u /tmp/expected-melange-owned.lst /tmp/melange-owned.lst
+      diff -u /tmp/expected-runner-owned.lst /tmp/runner-owned.lst

@@ -1,0 +1,61 @@
+name: Start the coverage profile with the xcover tool 
+
+needs:
+  packages:
+    - busybox
+    - ${{inputs.package}}
+  capabilities:
+    add:
+      # xcover attaches BPF uprobes to the profiled interpreter.
+      - CAP_SYS_ADMIN
+
+inputs:
+  package:
+    description: The xcover package
+    required: false
+    default: xcover
+  executable-path:
+    description: The path to the executable of the application to test.
+    required: true
+  exclude-functions:
+    description: The function symbols to exclude from profiling as a regular expression.
+    required: false
+  include-functions:
+    description: The function symbols to include in profiling as a regular expression. When set, only matching symbols are profiled.
+    required: false
+  scope:
+    description: 'The function scope to profile: "binary" (all functions) or "project" (project module only). The "project" scope is only supported by Go binaries and is a no-op for others.'
+    required: false
+    default: project
+  log-level:
+    description: The log level of the xcover profile command.
+    required: false
+    default: info
+  verbose:
+    description: Enable verbosity of the xcover profile command. It prints out all the functions being traced real-time.
+    required: false
+    default: "false"
+  wait-timeout:
+    description: The maximum amount of time to wait for the xcover profiler to be ready for profiling, in seconds.
+    required: false
+    default: "60"
+
+pipeline:
+  - runs: |
+
+      # Run profile in background.
+      xcover run \
+        --path ${{inputs.executable-path}} \
+        --exclude=${{inputs.exclude-functions}} \
+        --include=${{inputs.include-functions}} \
+        --scope=${{inputs.scope}} \
+        --log-level=${{inputs.log-level}} \
+        --verbose=${{inputs.verbose}} \
+        --status \
+        --detach
+
+      # Run a sync barrier, that is:
+      # the tracee that is going to be tested
+      # is being traced.
+      xcover wait --timeout ${{inputs.wait-timeout}}s
+

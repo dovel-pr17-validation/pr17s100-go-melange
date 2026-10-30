@@ -1,0 +1,99 @@
+# Melange pipelines
+
+This directory contains built-in pipelines. For more information on how to add
+new built-in pipelines, consult [Creating a new built-in pipeline](/docs/PIPELINES.md#creating-new-built-in-pipelines).
+
+<!-- start:pipeline-reference-gen -->
+# Pipeline Reference
+
+
+- [fetch](#fetch)
+- [git-am](#git-am)
+- [git-checkout](#git-checkout)
+- [patch](#patch)
+- [strip](#strip)
+
+## fetch
+
+Fetch and extract external object into workspace
+
+### Inputs
+
+| Name | Required | Description | Default |
+| ---- | -------- | ----------- | ------- |
+| delete | false | Whether to delete the fetched artifact after unpacking.  | false |
+| directory | false | The directory to extract the artifact into (passed to `tar -C`)  | . |
+| dns-timeout | false | The timeout (in seconds) to use for DNS lookups. The fetch will fail if the timeout is hit.  | 20 |
+| expected-none | false | There is no expected checksum.  |  |
+| expected-sha256 | false | The expected SHA256 of the downloaded artifact.  |  |
+| expected-sha512 | false | The expected SHA512 of the downloaded artifact.  |  |
+| extract | false | Whether to extract the downloaded artifact as a source tarball.  | true |
+| purl-name | false | package-URL (PURL) name for use in SPDX SBOM External References  | ${{package.name}} |
+| purl-version | false | package-URL (PURL) version for use in SPDX SBOM External References  | ${{package.version}} |
+| reason | false | Provide reason why fetch is used, instead of git-checkout  |  |
+| retry-limit | false | The number of times to retry fetching before failing.  | 5 |
+| strip-components | false | The number of path components to strip while extracting.  | 1 |
+| timeout | false | The timeout (in seconds) to use for connecting and reading. The fetch will fail if the timeout is hit.  | 5 |
+| uri | true | The URI to fetch as an artifact.  |  |
+
+## git-am
+
+Apply patches with git am
+
+### Inputs
+
+| Name | Required | Description | Default |
+| ---- | -------- | ----------- | ------- |
+| patches | true | A list of patches to apply with git am, as a whitespace delimited string.  Patches are resolved relative to the workspace root, which is where melange copies the contents of the source directory (--source-dir, defaulting to the directory containing the melange YAML file).  This is the same convention used by the 'patch' pipeline: place patch files in the package's source directory (e.g. ./my-package/) alongside the YAML file.  This pipeline assumes that git-checkout used the default destination ('.'), so the workspace root is the git repository.  If git-checkout clones into a subdirectory, the patches must include the path relative to the workspace root.  |  |
+
+## git-checkout
+
+Check out sources from git
+
+### Inputs
+
+| Name | Required | Description | Default |
+| ---- | -------- | ----------- | ------- |
+| branch | false | The branch to check out, otherwise HEAD is checked out. For reproducibility, tag is generally favored over branch. Branch and tag are mutually exclusive.  |  |
+| cherry-picks | false | List of cherry picks to apply. New line separated entries. Lines can be empty. Any content on a line after `#` is ignored. After removing comments, each line is of the form:      [branch/]commit-id: comment explaining cherry-pick  comment and commit-id are required.  branch on origin that the commit lives should be provided or git is not guaranteed to have a reference to the commit-id.    Example:     cherry-picks: |       3.10/62705d869aca4055e8a96e2ed4f9013e9917c661:  |  |
+| depth | false | The depth to use when cloning. Use -1 to get full branch history. If 'branch' and 'expected-commit' are provided the default is -1. Otherwise, default is to use '1' (shallow clone).  | unset |
+| destination | false | The path to check out the sources to.  | . |
+| expected-commit | false | The expected commit hash  |  |
+| expected-commit-is-branch-tip | false | When "true", require that expected-commit exactly matches the tip of the checked-out branch instead of allowing any older commit on the branch.  Use this when a branch is used as an immutable release pointer (e.g. version-named release branches) so that a stale expected-commit -- for example after bumping the version but forgetting to update the commit -- fails loudly instead of silently checking out old code. Only valid together with 'branch'; mutually exclusive with 'tag'.  | false |
+| initial-backoff | false | Initial backoff duration in seconds before first retry.  | 2 |
+| max-backoff | false | Maximum backoff duration in seconds between retries.  | 60 |
+| max-retries | false | Maximum number of retry attempts for git clone operation on failure.  | 3 |
+| reason | false | Provide reason for a mutable reference.  |  |
+| recurse-submodules | false | Indicates whether --recurse-submodules should be passed to git clone.  | false |
+| repository | true | The repository to check out sources from.  |  |
+| shallow-submodules | false | Whether to use --shallow-submodules when recurse-submodules is true. Ignored if recurse-submodules is false.  | false |
+| sparse-paths | false | List of directory paths to checkout when using sparse-checkout (cone mode). This is useful for monorepos where you only need specific subdirectories. When specified, only these directories will be checked out from the repository. Uses cone mode for optimal performance. Example:   sparse-paths:     - omnibump     - shared/lib  |  |
+| submodule-jobs | false | The number of concurrent jobs to use when recurse-submodules is true. Ignored if recurse-submodules is false.  | 1 |
+| tag | false | The tag to check out.  Branch and tag are mutually exclusive.  |  |
+| type-hint | false | Type hint to use during SBOM generation for the provided git repository. This is primarily used to identify Gitlab based sources which are not heuristically identifiable as Gitlab.  Supported hints: gitlab.  |  |
+
+## patch
+
+Apply patches
+
+### Inputs
+
+| Name | Required | Description | Default |
+| ---- | -------- | ----------- | ------- |
+| fuzz | false | Sets the maximum fuzz factor. This option only applies to context diffs, and causes patch to ignore up to that many lines in looking for places to install a hunk.  | 2 |
+| patches | false | A list of patches to apply, as a whitespace delimited string.  |  |
+| series | false | A quilt-style patch series file to apply.  |  |
+| strip-components | false | The number of path components to strip while extracting.  | 1 |
+
+## strip
+
+Strip binaries
+
+### Inputs
+
+| Name | Required | Description | Default |
+| ---- | -------- | ----------- | ------- |
+| opts | false | The option flags to pass to the strip command.  | -g |
+
+
+<!-- end:pipeline-reference-gen -->
